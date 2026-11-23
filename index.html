@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Microscope</title>
+<style>
+  :root { --bg:#16171a; --panel:#202227; --text:#e6e6e6; --muted:#8b8f98; --accent:#6aa9ff;
+          --rec:#ff5a5a; --warn:#f0b84a; --line:#30333a; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.4 system-ui, sans-serif;
+         display:flex; gap:16px; padding:16px; min-height:100vh; flex-wrap:wrap; }
+  .view { position:relative; flex:1 1 560px; display:flex; align-items:center; justify-content:center;
+          background:#000; border-radius:8px; overflow:hidden; min-height:300px; }
+  .view img { width:100%; height:100%; max-height:calc(100vh - 32px); object-fit:contain; }
+  .badge { position:absolute; top:12px; left:12px; background:var(--rec); color:#fff; font-weight:600;
+           padding:4px 10px; border-radius:999px; display:none; }
+  .badge.on { display:block; animation:pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity:.55; } }
+  .flash { position:absolute; inset:0; background:#fff; opacity:0; pointer-events:none; transition:opacity .25s; }
+  .panel { flex:0 0 290px; background:var(--panel); border-radius:8px; padding:16px; align-self:flex-start; }
+  h1 { font-size:16px; margin:0 0 4px; }
+  .status { color:var(--muted); font-size:12px; margin-bottom:14px; }
+  .status.warn { color:var(--warn); }
+  .row { display:flex; gap:8px; }
+  .ctrl { margin:14px 0; }
+  .ctrl label { display:flex; justify-content:space-between; margin-bottom:4px; }
+  .ctrl .val { color:var(--accent); font-variant-numeric:tabular-nums; }
+  .ctrl.off { opacity:.4; }
+  .hint { color:var(--muted); font-size:12px; }
+  input[type=range] { width:100%; accent-color:var(--accent); }
+  .toggle { display:flex; align-items:center; gap:8px; cursor:pointer; }
+  button { flex:1; padding:10px; border:0; border-radius:6px; font:inherit; cursor:pointer; }
+  .snap { background:var(--accent); color:#000; font-weight:600; }
+  .record { background:var(--line); color:var(--text); font-weight:600; }
+  .record.on { background:var(--rec); color:#fff; }
+  .reset { width:100%; background:var(--line); color:var(--text); }
+  .msg { font-size:12px; color:var(--muted); margin-top:10px; word-break:break-all; min-height:1.4em; }
+  .keys { font-size:12px; color:var(--muted); margin-top:12px; }
+  kbd { background:var(--line); border-radius:3px; padding:0 5px; font:inherit; }
+  hr { border:0; border-top:1px solid var(--line); margin:16px 0; }
+</style>
+</head>
+<body>
+  <div class="view">
+    <img id="stream" src="/stream" alt="microscope live view">
+    <div class="badge" id="badge">● REC 0:00</div>
+    <div class="flash" id="flash"></div>
+  </div>
+  <div class="panel">
+    <h1>Microscope</h1>
+    <div class="status" id="status">connecting…</div>
+    <div class="row">
+      <button class="snap" id="snap">Snap photo</button>
+      <button class="record" id="record">Record video</button>
+    </div>
+    <div class="msg" id="msg"></div>
+    <hr>
+    <div class="ctrl"><label class="toggle"><input type="checkbox" id="awb"> Auto white balance
+      <span class="hint">(removes green tint)</span></label></div>
+    <div id="controls"></div>
+    <button class="reset" id="reset">Reset to microscope defaults</button>
+    <div class="keys"><kbd>space</kbd> photo · <kbd>R</kbd> start/stop video</div>
+  </div>
+<script>
+const labels = { brightness:"Brightness", gain_automatic:"Auto gain", gain:"Gain", exposure:"Exposure" };
+let ctrls = {}, recording = false, dragging = false;
+const pending = {};
+const $ = id => document.getElementById(id);
+const fmt = s => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+
+async function post(url, body) {
+  const r = await fetch(url, { method:"POST", body: JSON.stringify(body || {}) });
+  return r.json();
+}
+
+async function load() {
+  let d;
+  try { d = await (await fetch("/controls")).json(); }
+  catch { $("status").textContent = "server not running"; return; }
+  const st = $("status");
+  if (d.status !== "ok") { st.textContent = d.status; st.className = "status warn"; }
+  else if (d.fps && d.fps < 5) {
+    st.textContent = `live · ${d.fps} fps: very slow, plug the camera straight into the computer (not a hub)`;
+    st.className = "status warn";
+  } else { st.textContent = `live · ${d.fps || "…"} fps`; st.className = "status"; }
+  setRecording(d.recording, d.rec_seconds);
+  syncAwb(d.awb);
+  if (!dragging) { ctrls = d.controls; render(); }
+}
+
+// auto white balance: the server holds the live state; the browser remembers the
+// choice so it comes back after the server restarts
+let awbRestored = false;
+function savedAwb() { try { return localStorage.getItem("awb"); } catch { return null; } }
+function syncAwb(serverOn) {
+  if (!awbRestored) {
+    awbRestored = true;
+    const saved = savedAwb();
+    if (saved !== null && (saved === "1") !== serverOn) { setAwb(saved === "1"); return; }
+  }
+  $("awb").checked = serverOn;
+}
+async function setAwb(on) {
+  $("awb").checked = on;
+  try { localStorage.setItem("awb", on ? "1" : "0"); } catch {}
+  const d = await post("/awb", { on });
+  if (!d.ok) msg(d.error);
+}
+
+function setRecording(on, secs) {
+  recording = on;
+  $("record").textContent = on ? `Stop (${fmt(secs || 0)})` : "Record video";
+  $("record").classList.toggle("on", on);
+  $("badge").textContent = `● REC ${fmt(secs || 0)}`;
+  $("badge").classList.toggle("on", on);
+}
+
+function render() {
+  const box = $("controls"); box.innerHTML = "";
+  for (const [name, c] of Object.entries(ctrls)) {
+    const div = document.createElement("div");
+    div.className = "ctrl" + (c.inactive ? " off" : "");
+    if (c.type === "bool") {
+      div.innerHTML = `<label class="toggle"><input type="checkbox" ${c.value ? "checked" : ""}>
+        ${labels[name] || name} <span class="hint">(not recommended)</span></label>`;
+      div.querySelector("input").onchange = e => setCtrl(name, e.target.checked ? 1 : 0, true);
+    } else {
+      div.innerHTML = `<label><span>${labels[name] || name}</span><span class="val">${c.value}</span></label>
+        <input type="range" min="${c.min}" max="${c.max}" value="${c.value}" ${c.inactive ? "disabled" : ""}>`;
+      const input = div.querySelector("input"), val = div.querySelector(".val");
+      input.oninput = e => { dragging = true; val.textContent = e.target.value; setCtrl(name, +e.target.value, false); };
+      input.onchange = () => { dragging = false; };
+      if (c.inactive) div.title = "Turn off Auto gain to adjust this";
+    }
+    box.appendChild(div);
+  }
+}
+
+// throttle slider updates so dragging doesn't flood the camera
+function setCtrl(name, value, rerender) {
+  clearTimeout(pending[name]);
+  pending[name] = setTimeout(async () => {
+    const d = await post("/set", { name, value });
+    if (!d.ok) { msg(d.error); return; }
+    ctrls = d.controls; if (rerender) render();
+  }, rerender ? 0 : 60);
+}
+
+function msg(t) { $("msg").textContent = t; }
+
+async function snap() {
+  const d = await post("/snap");
+  msg(d.ok ? "photo saved: " + d.path : d.error);
+  if (d.ok) { $("flash").style.opacity = .6; setTimeout(() => $("flash").style.opacity = 0, 120); }
+}
+
+async function toggleRecord() {
+  const d = await post(recording ? "/record/stop" : "/record/start");
+  if (!d.ok) { msg(d.error); return; }
+  msg(recording ? "video saved: " + d.path : "recording to " + d.path);
+  setRecording(!recording, 0);
+}
+
+$("awb").onchange = e => setAwb(e.target.checked);
+$("snap").onclick = snap;
+$("record").onclick = toggleRecord;
+$("reset").onclick = async () => { const d = await post("/reset"); if (d.ok) { ctrls = d.controls; render(); msg("reset to gain 0, exposure 4, auto gain off"); } };
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT" && e.target.type !== "range") return;
+  if (e.key === " ") { e.preventDefault(); snap(); }
+  if (e.key === "r" || e.key === "R") { e.preventDefault(); toggleRecord(); }
+});
+// if the stream drops (unplug), reconnect
+$("stream").onerror = e => setTimeout(() => { e.target.src = "/stream?" + Date.now(); }, 1500);
+load(); setInterval(load, 1000);
+</script>
+</body>
+</html>
